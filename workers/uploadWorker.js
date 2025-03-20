@@ -1,7 +1,6 @@
 const { parentPort, workerData } = require("worker_threads");
 const mongoose = require("mongoose");
-const xlsx = require("xlsx");
-const fs = require("fs");
+const XLSX = require("xlsx");
 const path = require("path");
 
 // Import Models
@@ -13,82 +12,127 @@ const Carrier = require("../models/Carrier");
 const Policy = require("../models/Policy");
 
 // MongoDB Connection
-mongoose.connect("mongodb://127.0.0.1:27017/policyDB", {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+const connectDB = require("../config/db");
 
-// Function to Process the File
-const processFile = async (filePath) => {
+async function processFile(filePath) {
   try {
-    const workbook = xlsx.readFile(filePath);
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const jsonData = xlsx.utils.sheet_to_json(sheet);
+    console.log(`📂 Processing file: ${filePath}`);
 
-    for (const row of jsonData) {
-      // Insert Agent
-      let agent = await Agent.findOne({ name: row["Agent Name"] });
-      if (!agent) agent = await Agent.create({ name: row["Agent Name"] });
+    // Ensure DB connection is established
+    await connectDB();
+    console.log("✅ Connected to MongoDB");
 
-      // Insert User
-      let user = await User.findOne({ email: row["Email"] });
-      if (!user) {
-        user = await User.create({
-          firstName: row["First Name"],
-          dob: new Date(row["DOB"]),
-          address: row["Address"],
-          phoneNumber: row["Phone Number"],
-          state: row["State"],
-          zipCode: row["Zip Code"],
-          email: row["Email"],
-          gender: row["Gender"],
-          userType: row["User Type"],
-        });
-      }
+    // Load and parse the file
+    const workbook = XLSX.readFile(filePath);
+    const sheetName = workbook.SheetNames[0];
+    const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
 
-      // Insert Account
-      let account = await Account.findOne({
-        accountName: row["Account Name"],
-        userId: user._id,
-      });
-      if (!account)
-        account = await Account.create({
-          accountName: row["Account Name"],
-          userId: user._id,
-        });
+    if (!data.length) {
+      throw new Error("Excel file is empty or not formatted correctly");
+    }
 
-      // Insert LOB (Policy Category)
-      let lob = await LOB.findOne({ categoryName: row["Policy Category"] });
-      if (!lob)
-        lob = await LOB.create({ categoryName: row["Policy Category"] });
+    console.log(`📊 Extracted ${data.length} rows`);
 
-      // Insert Carrier
-      let carrier = await Carrier.findOne({
-        companyName: row["Policy Carrier"],
-      });
-      if (!carrier)
-        carrier = await Carrier.create({ companyName: row["Policy Carrier"] });
+    for (const row of data) {
+      try {
+        // Validate and Insert Agent Data
+        let agent = row["agent"]
+          ? await Agent.findOneAndUpdate(
+              { name: row["agent"] },
+              { name: row["agent"] },
+              { upsert: true, new: true }
+            )
+          : null;
 
-      // Insert Policy
-      let policy = await Policy.findOne({ policyNumber: row["Policy Number"] });
-      if (!policy) {
-        policy = await Policy.create({
-          policyNumber: row["Policy Number"],
-          policyStartDate: new Date(row["Policy Start Date"]),
-          policyEndDate: new Date(row["Policy End Date"]),
-          policyCategory: lob._id,
-          company: carrier._id,
+        // Validate and Insert User Data
+        if (!row["firstname"] || !row["dob"] || !row["email"]) {
+          console.warn("⚠️ Skipping row - Missing Required User Fields:", row);
+          continue;
+        }
+
+        let user = await User.findOneAndUpdate(
+          { email: row["email"] },
+          {
+            firstName: row["firstname"],
+            dob: new Date(row["dob"]),
+            address: row["address"] || "",
+            phone: row["phone"] || "",
+            state: row["state"] || "",
+            zipCode: row["zip"] || "",
+            gender: row["gender"] || "",
+            userType: row["userType"] || "",
+          },
+          { upsert: true, new: true }
+        );
+
+        // Validate and Insert Account Data
+        let account = row["account_name"]
+          ? await Account.findOneAndUpdate(
+              { accountName: row["account_name"] },
+              { accountName: row["account_name"] },
+              { upsert: true, new: true }
+            )
+          : null;
+
+        // Validate and Insert LOB (Policy Category)
+        let lob = row["category_name"]
+          ? await LOB.findOneAndUpdate(
+              { categoryName: row["category_name"] },
+              { categoryName: row["category_name"] },
+              { upsert: true, new: true }
+            )
+          : null;
+
+        // Validate and Insert Carrier
+        let carrier = row["company_name"]
+          ? await Carrier.findOneAndUpdate(
+              { companyName: row["company_name"] },
+              { companyName: row["company_name"] },
+              { upsert: true, new: true }
+            )
+          : null;
+
+        // Validate and Insert Policy
+        if (
+          !row["policy_number"] ||
+          !row["policy_start_date"] ||
+          !row["policy_end_date"]
+        ) {
+          console.warn(
+            "⚠️ Skipping row - Missing Required Policy Fields:",
+            row
+          );
+          continue;
+        }
+
+        await Policy.create({
+          policyNumber: row["policy_number"],
+          policyStartDate: new Date(row["policy_start_date"]),
+          policyEndDate: new Date(row["policy_end_date"]),
+          policyCategory: lob ? lob._id : null,
+          company: carrier ? carrier._id : null,
           user: user._id,
         });
+
+        console.log("✅ Inserted row successfully:", row);
+      } catch (rowError) {
+        console.error("❌ Error processing row:", rowError.message);
       }
     }
 
-    fs.unlinkSync(filePath); // Delete the file after processing
-    parentPort.postMessage("File processed successfully");
+    console.log("🎉 File processing completed successfully");
+    parentPort.postMessage({ message: "File processed successfully" });
   } catch (error) {
-    parentPort.postMessage(`Error processing file: ${error.message}`);
+    console.error("❌ Error processing file:", error.message);
+    parentPort.postMessage({
+      message: "Error processing file",
+      error: error.message,
+    });
+  } finally {
+    mongoose.connection.close();
+    console.log("🔌 Disconnected from MongoDB");
   }
-};
+}
 
-// Start processing the file
+// Start processing
 processFile(workerData.filePath);
